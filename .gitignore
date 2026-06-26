@@ -1,0 +1,31 @@
+# Entornos virtuales (creados por los lanzadores)
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Configuración local del usuario (se guarda fuera del repo de todas formas)
+settings.json
+
+# Carpetas de salida típicas
+output/
+salida/
+contact_sheets/
+*.contact_sheets/
+
+# Sistema
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editores
+.vscode/
+.idea/
+*.swp

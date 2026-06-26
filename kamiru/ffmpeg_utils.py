@@ -1,0 +1,214 @@
+"""Localización de ffmpeg, sondeo de metadatos y extracción de fotogramas.
+
+Estrategia de calidad / color:
+  * Los fotogramas se extraen a PNG, que es un formato SIN PÉRDIDA.
+  * NO se aplica ningún filtro de color, escalado ni reencuadre. El único paso
+    inevitable es la conversión YUV->RGB que hace el decodificador para poder
+    guardar PNG; eso es exactamente lo que muestra cualquier reproductor y no
+    constituye una "corrección" ni alteración del color.
+  * No se fuerza -pix_fmt, de modo que si el origen es de 10 bits se conserva la
+    profundidad en el PNG.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+class FFmpegError(RuntimeError):
+    pass
+
+
+def _no_window_kwargs():
+    """Evita que en Windows aparezca una ventana de consola al lanzar ffmpeg."""
+    if sys.platform.startswith("win"):
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        return {"startupinfo": si,
+                "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)}
+    return {}
+
+
+def find_ffmpeg() -> str:
+    """Devuelve la ruta a un ejecutable de ffmpeg utilizable.
+
+    Prioriza el binario empaquetado por imageio-ffmpeg (igual en todos los
+    sistemas, no requiere que el usuario instale nada). Si no está disponible,
+    usa el ffmpeg del sistema (PATH).
+    """
+    try:
+        import imageio_ffmpeg  # type: ignore
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and Path(exe).exists():
+            return exe
+    except Exception:
+        pass
+
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+
+    raise FFmpegError(
+        "No se encontró ffmpeg. Instala las dependencias con "
+        "'pip install -r requirements.txt' (incluye imageio-ffmpeg) o instala "
+        "ffmpeg en tu sistema."
+    )
+
+
+# --- Sondeo de metadatos -------------------------------------------------
+
+_DURATION_RE = re.compile(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)")
+_VIDEO_RE = re.compile(r"Stream #\d+:\d+.*Video:.*?(\d{2,5})x(\d{2,5})")
+_FPS_RE = re.compile(r"(\d+(?:\.\d+)?)\s*fps")
+
+
+class VideoInfo:
+    def __init__(self, duration=0.0, width=0, height=0, fps=0.0):
+        self.duration = duration  # segundos (float)
+        self.width = width
+        self.height = height
+        self.fps = fps
+
+    @property
+    def duration_hhmmss(self) -> str:
+        s = int(self.duration)
+        return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+
+def probe(ffmpeg: str, video_path: str) -> VideoInfo:
+    """Sondea duración, resolución y fps del video leyendo la salida de ffmpeg."""
+    proc = subprocess.run(
+        [ffmpeg, "-hide_banner", "-i", video_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        **_no_window_kwargs(),
+    )
+    text = (proc.stderr or b"").decode("utf-8", "replace")
+
+    info = VideoInfo()
+    m = _DURATION_RE.search(text)
+    if m:
+        h, mn, sec = m.groups()
+        info.duration = int(h) * 3600 + int(mn) * 60 + float(sec)
+    m = _VIDEO_RE.search(text)
+    if m:
+        info.width, info.height = int(m.group(1)), int(m.group(2))
+    m = _FPS_RE.search(text)
+    if m:
+        info.fps = float(m.group(1))
+    return info
+
+
+# --- Extracción de fotogramas -------------------------------------------
+
+_FRAME_RE = re.compile(r"frame=\s*(\d+)")
+
+
+def extract_frames(
+    ffmpeg: str,
+    video_path: str,
+    out_dir: str,
+    start: float = 0.0,
+    end=None,
+    fps=None,
+    progress_cb=None,
+    cancel_check=None,
+):
+    """Extrae fotogramas a PNG (sin pérdida) en out_dir.
+
+    Parámetros:
+      start, end : recorte en segundos. end=None => hasta el final del video.
+      fps        : fotogramas por segundo a muestrear. None => TODOS los
+                   fotogramas del rango (un PNG por cada cuadro del video).
+      progress_cb: callback(frames_procesados, total_estimado) para la barra.
+      cancel_check: callable que devuelve True si se debe abortar.
+
+    Devuelve la lista ordenada de rutas PNG generadas.
+    """
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    cmd = [ffmpeg, "-hide_banner", "-nostdin", "-y"]
+
+    # Búsqueda de inicio antes de -i (rápida). Suficientemente precisa para uso
+    # artístico; evita reprocesar todo el video.
+    if start and start > 0:
+        cmd += ["-ss", f"{start:.3f}"]
+    cmd += ["-i", video_path]
+    if end is not None and end > start:
+        cmd += ["-t", f"{(end - start):.3f}"]
+
+    # Filtro de muestreo de fps SOLO si se pidió un fps concreto.
+    if fps is not None and float(fps) > 0:
+        cmd += ["-vf", f"fps={_fps_arg(fps)}"]
+
+    # Sin -pix_fmt: se conserva la profundidad/píxel nativos en el PNG.
+    pattern = str(out / "frame_%06d.png")
+    cmd += [
+        "-an", "-sn", "-dn",          # ignora audio/subtítulos/datos
+        "-progress", "pipe:1", "-nostats",
+        pattern,
+    ]
+
+    # Estimación de total para la barra de progreso.
+    total_est = None
+    if fps is not None and float(fps) > 0 and end is not None:
+        total_est = max(1, int(round((end - start) * float(fps))))
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        bufsize=1,
+        **_no_window_kwargs(),
+    )
+
+    try:
+        for line in proc.stdout:
+            if cancel_check and cancel_check():
+                proc.terminate()
+                raise _Cancelled()
+            line = line.strip()
+            if line.startswith("frame="):
+                m = _FRAME_RE.search(line)
+                if m and progress_cb:
+                    progress_cb(int(m.group(1)), total_est)
+        proc.wait()
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+
+    if proc.returncode not in (0, None):
+        err = ""
+        try:
+            err = (proc.stderr.read() or "")[-1500:]
+        except Exception:
+            pass
+        raise FFmpegError(f"ffmpeg terminó con error (código {proc.returncode}).\n{err}")
+
+    frames = sorted(str(p) for p in out.glob("frame_*.png"))
+    if not frames:
+        raise FFmpegError(
+            "No se extrajo ningún fotograma. Revisa el rango de tiempo y el "
+            "valor de fps."
+        )
+    return frames
+
+
+def _fps_arg(fps) -> str:
+    """Formatea el fps para ffmpeg admitiendo decimales (p. ej. 0.5)."""
+    f = float(fps)
+    if f == int(f):
+        return str(int(f))
+    return repr(f)
+
+
+class _Cancelled(Exception):
+    """Señal interna de cancelación por parte del usuario."""
+    pass

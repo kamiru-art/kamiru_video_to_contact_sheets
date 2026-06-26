@@ -1,0 +1,6 @@
+# Dependencias de Kamiru — Video a Contact Sheets
+# Instálalas con:  python -m pip install -r requirements.txt
+# (los lanzadores run.command / run.bat / run.sh lo hacen automáticamente)
+
+Pillow>=9.2.0
+imageio-ffmpeg>=0.4.8
